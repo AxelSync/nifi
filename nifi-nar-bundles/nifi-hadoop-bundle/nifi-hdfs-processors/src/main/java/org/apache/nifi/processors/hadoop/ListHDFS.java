@@ -40,6 +40,7 @@ import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.components.state.Scope;
 import org.apache.nifi.components.state.StateMap;
 import org.apache.nifi.distributed.cache.client.DistributedMapCacheClient;
+import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.flowfile.attributes.CoreAttributes;
 import org.apache.nifi.processor.ProcessContext;
@@ -69,8 +70,9 @@ import java.util.regex.Pattern;
 @TriggerWhenEmpty
 @InputRequirement(Requirement.INPUT_FORBIDDEN)
 @Tags({"hadoop", "HDFS", "get", "list", "ingest", "source", "filesystem"})
-@CapabilityDescription("Retrieves a listing of files from HDFS. Each time a listing is performed, the files with the latest timestamp will be excluded "
-        + "and picked up during the next execution of the processor. This is done to ensure that we do not miss any files, or produce duplicates, in the "
+@CapabilityDescription("Retrieves a listing of files from HDFS. Each time a listing is performed, if Skip Last is set to enabled, "
+        + "the files with the latest timestamp will be excluded and picked up during the next execution of the processor. "
+        + "This is done to ensure that we do not miss any files, or produce duplicates, in the "
         + "cases where files with the same timestamp are written immediately before and after a single execution of the processor. For each file that is "
         + "listed in HDFS, this processor creates a FlowFile that represents the HDFS file to be fetched in conjunction with FetchHDFS. This Processor is "
         +  "designed to run on Primary Node only in a cluster. If the primary node changes, the new Primary Node will pick up where the previous node left "
@@ -119,6 +121,47 @@ public class ListHDFS extends AbstractHadoopProcessor {
         .defaultValue("[^\\.].*")
         .addValidator(StandardValidators.REGULAR_EXPRESSION_VALIDATOR)
         .build();
+
+    public static final PropertyDescriptor SKIP_LAST = new PropertyDescriptor.Builder()
+            .name("Skip Last")
+            .description("If enabled, the files with the latest timestamp will be excluded and picked up during the next "
+                    + "execution of the processor. This is done to ensure that we do not miss any files, or produce duplicates, "
+                    + "in the cases where files with the same timestamp are written immediately before and after a single execution of the processor.")
+            .required(false)
+            .allowableValues("true", "false")
+            .defaultValue("true")
+            .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
+
+    public static final PropertyDescriptor ENABLE_FRAGMENT_ATTRIBUTES = new PropertyDescriptor.Builder()
+            .name("Enable Fragment Attributes")
+            .description("If enabled, will add fragmentation attributes to the output flowfiles.")
+            .required(false)
+            .allowableValues("true", "false")
+            .defaultValue("false")
+            .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
+
+    public static final PropertyDescriptor FRAGMENT_ATTRIBUTES_STRATEGY = new PropertyDescriptor.Builder()
+            .name("Fragment Attributes Strategy")
+            .description("If Fragment Attributes is enabled, this .")
+            .required(false)
+            .allowableValues(
+                    new AllowableValue("oneForAll", "One For All", "Will create a single "
+                            + "fragmentation group. Therefore, all files will have the same fragment.identifier, the same fragment.count, "
+                            + "equal to the total number N of listed files, and fragment.index ∈ [0, N)."),
+                    new AllowableValue("perSubDir", "Per Subdirectory", "will create different fragmentation "
+                            + "groups, one for each scanned subdirectory of the given path. Therefore, for each subfolder, flowfiles will "
+                            + "have a specific fragment.identifier, fragment.count will be, for each flowfile, equal to the number Ni of "
+                            + "files in the i-th directory, and fragment.index ∈ [0, Ni).")
+                    )
+            .defaultValue("oneForAll")
+            .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
+
 
     private static final String FILTER_MODE_DIRECTORIES_AND_FILES = "filter-mode-directories-and-files";
     private static final String FILTER_MODE_FILES_ONLY = "filter-mode-files-only";
@@ -172,6 +215,11 @@ public class ListHDFS extends AbstractHadoopProcessor {
         .description("All FlowFiles are transferred to this relationship")
         .build();
 
+    public static final Relationship REL_ORIGINAL = new Relationship.Builder()
+            .name("original")
+            .description("Original input FlowFiles are transferred to this relationship")
+            .build();
+
     private volatile long latestTimestampListed = -1L;
     private volatile long latestTimestampEmitted = -1L;
     private volatile long lastRunTimestamp = -1L;
@@ -207,6 +255,7 @@ public class ListHDFS extends AbstractHadoopProcessor {
     public Set<Relationship> getRelationships() {
         final Set<Relationship> relationships = new HashSet<>();
         relationships.add(REL_SUCCESS);
+        relationships.add(REL_ORIGINAL);
         return relationships;
     }
 
@@ -246,7 +295,7 @@ public class ListHDFS extends AbstractHadoopProcessor {
      * @param context processor context with properties values
      * @return a Set containing only those FileStatus objects that we want to list
      */
-    Set<FileStatus> determineListable(final Set<FileStatus> statuses, ProcessContext context) {
+    Set<FileStatus> determineListable(final Set<FileStatus> statuses, ProcessContext context, Boolean skipLast) {
         final long minTimestamp = this.latestTimestampListed;
         final TreeMap<Long, List<FileStatus>> orderedEntries = new TreeMap<>();
 
@@ -292,24 +341,33 @@ public class ListHDFS extends AbstractHadoopProcessor {
         if (orderedEntries.size() > 0) {
             long latestListingTimestamp = orderedEntries.lastKey();
 
-            // If the last listing time is equal to the newest entries previously seen,
-            // another iteration has occurred without new files and special handling is needed to avoid starvation
-            if (latestListingTimestamp == minTimestamp) {
-                // We are done if the latest listing timestamp is equal to the last processed time,
-                // meaning we handled those items originally passed over
-                if (latestListingTimestamp == latestTimestampEmitted) {
-                    return Collections.emptySet();
+            if (skipLast) {
+                // If the last listing time is equal to the newest entries previously seen,
+                // another iteration has occurred without new files and special handling is needed to avoid starvation
+                if (latestListingTimestamp == minTimestamp) {
+                    // We are done if the latest listing timestamp is equal to the last processed time,
+                    // meaning we handled those items originally passed over
+                    if (latestListingTimestamp == latestTimestampEmitted) {
+                        return Collections.emptySet();
+                    }
+                } else {
+                    // Otherwise, newest entries are held back one cycle to avoid issues in writes occurring exactly when the listing is being performed to avoid missing data
+                    orderedEntries.remove(latestListingTimestamp);
+                }
+
+                for (List<FileStatus> timestampEntities : orderedEntries.values()) {
+                    toList.addAll(timestampEntities);
                 }
             } else {
-                // Otherwise, newest entries are held back one cycle to avoid issues in writes occurring exactly when the listing is being performed to avoid missing data
-                orderedEntries.remove(latestListingTimestamp);
-            }
+                if (latestListingTimestamp == minTimestamp && latestListingTimestamp == latestTimestampEmitted) {
+                    return Collections.emptySet();
+                }
 
-            for (List<FileStatus> timestampEntities : orderedEntries.values()) {
-                for (FileStatus status : timestampEntities) {
-                    toList.add(status);
+                for (List<FileStatus> timestampEntities : orderedEntries.values()) {
+                    toList.addAll(timestampEntities);
                 }
             }
+
         }
 
         return toList;
@@ -317,6 +375,12 @@ public class ListHDFS extends AbstractHadoopProcessor {
 
     @Override
     public void onTrigger(final ProcessContext context, final ProcessSession session) throws ProcessException {
+
+        FlowFile originalFlowFile = session.get();
+        if (originalFlowFile == null) {
+            return;
+        }
+
         // We have to ensure that we don't continually perform listings, because if we perform two listings within
         // the same millisecond, our algorithm for comparing timestamps will not work. So we ensure here that we do
         // not let that happen.
@@ -387,7 +451,11 @@ public class ListHDFS extends AbstractHadoopProcessor {
             return;
         }
 
-        final Set<FileStatus> listable = determineListable(statuses, context);
+        final Set<FileStatus> listable =
+                determineListable(
+                        statuses,
+                        context,
+                        context.getProperty(SKIP_LAST).evaluateAttributeExpressions().asBoolean());
         getLogger().debug("Of the {} files found in HDFS, {} are listable", new Object[] {statuses.size(), listable.size()});
 
         for (final FileStatus status : listable) {
