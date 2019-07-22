@@ -144,6 +144,10 @@ public class ListHDFS extends AbstractHadoopProcessor {
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
 
+    //TODO: evaluate where to put these
+    private final static String ONE_FOR_ALL_STRATEGY = "oneForAll";
+    private final static String PER_SUBDIRECTORY_STRATEGY = "perSubDir";
+
     public static final PropertyDescriptor FRAGMENT_ATTRIBUTES_STRATEGY = new PropertyDescriptor.Builder()
             .name("Fragment Attributes Strategy")
             .description("If Fragment Attributes is enabled, this .")
@@ -377,7 +381,7 @@ public class ListHDFS extends AbstractHadoopProcessor {
     public void onTrigger(final ProcessContext context, final ProcessSession session) throws ProcessException {
 
         FlowFile originalFlowFile = session.get();
-        if (originalFlowFile == null) {
+        if (originalFlowFile == null) { //TODO: Evaluate
             return;
         }
 
@@ -458,17 +462,38 @@ public class ListHDFS extends AbstractHadoopProcessor {
                         context.getProperty(SKIP_LAST).evaluateAttributeExpressions().asBoolean());
         getLogger().debug("Of the {} files found in HDFS, {} are listable", new Object[] {statuses.size(), listable.size()});
 
+        List<FlowFile> flowFiles = new ArrayList<>();
+
         for (final FileStatus status : listable) {
             final Map<String, String> attributes = createAttributes(status);
-            FlowFile flowFile = session.create();
-            flowFile = session.putAllAttributes(flowFile, attributes);
-            session.transfer(flowFile, REL_SUCCESS);
+            FlowFile flowFile = session.putAllAttributes(session.create(originalFlowFile), attributes);
+
+            flowFiles.add(flowFile);
 
             final long fileModTime = status.getModificationTime();
             if (fileModTime > latestTimestampEmitted) {
                 latestTimestampEmitted = fileModTime;
             }
         }
+
+
+        if(context.getProperty(ENABLE_FRAGMENT_ATTRIBUTES)
+                .evaluateAttributeExpressions().asBoolean()) {
+            String fragmentAttributeStrategy = context.getProperty(FRAGMENT_ATTRIBUTES_STRATEGY)
+                    .evaluateAttributeExpressions().getValue();
+            switch (fragmentAttributeStrategy){
+                case ONE_FOR_ALL_STRATEGY:
+                    break;
+                case PER_SUBDIRECTORY_STRATEGY:
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unknown Fragmentation Attributes strategy " + fragmentAttributeStrategy);
+            }
+        }
+
+        flowFiles.forEach(ff -> session.transfer(ff, REL_SUCCESS));
+
+        session.transfer(originalFlowFile, REL_ORIGINAL);
 
         final int listCount = listable.size();
         if ( listCount > 0 ) {
