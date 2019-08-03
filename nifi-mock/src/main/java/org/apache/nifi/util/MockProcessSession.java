@@ -639,7 +639,6 @@ public class MockProcessSession implements ProcessSession {
                 break;
             }
         }
-
         final Iterator<Long> processedItr = beingProcessed.iterator();
         while (processedItr.hasNext()) {
             final Long ffId = processedItr.next();
@@ -648,6 +647,7 @@ public class MockProcessSession implements ProcessSession {
                 beingProcessed.remove(ffId);
                 removedFlowFiles.add(flowFile.getId());
                 currentVersions.remove(ffId);
+                provenanceReporter.drop(flowFile, flowFile.getAttribute(CoreAttributes.DISCARD_REASON.key()));
                 return;
             }
         }
