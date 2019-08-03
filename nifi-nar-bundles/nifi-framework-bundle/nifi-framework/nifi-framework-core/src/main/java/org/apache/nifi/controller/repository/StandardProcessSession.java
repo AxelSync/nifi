@@ -2103,22 +2103,7 @@ public final class StandardProcessSession implements ProcessSession, ProvenanceE
         verifyTaskActive();
 
         flowFiles = validateRecordState(flowFiles);
-        for (final FlowFile flowFile : flowFiles) {
-            final StandardRepositoryRecord record = getRecord(flowFile);
-            record.markForDelete();
-            removedFlowFiles.add(flowFile.getAttribute(CoreAttributes.UUID.key()));
-
-            // if original connection is null, the FlowFile was created in this session, so we
-            // do not want to count it toward the removed count.
-            if (record.getOriginalQueue() == null) {
-                generatedProvenanceEvents.remove(flowFile);
-                removeForkEvents(flowFile);
-            } else {
-                removedCount++;
-                removedBytes += flowFile.getSize();
-                provenanceReporter.drop(flowFile, flowFile.getAttribute(CoreAttributes.DISCARD_REASON.key()));
-            }
-        }
+        flowFiles.forEach(this::remove);
     }
 
     private void removeForkEvents(final FlowFile flowFile) {
